@@ -12,6 +12,40 @@ fn freeze_path() -> PathBuf {
     PathBuf::from(SBPM_DIR).join("freeze")
 }
 
+fn repo_cache_path() -> PathBuf {
+    PathBuf::from(SBPM_DIR).join("repo.db")
+}
+
+pub fn save_repo_db(data: &str) -> Result<(), String> {
+    let dir = PathBuf::from(SBPM_DIR);
+    fs::create_dir_all(&dir).map_err(|e| format!("failed to create sbpm dir: {}", e))?;
+    fs::write(repo_cache_path(), data).map_err(|e| format!("failed to write repo.db: {}", e))
+}
+
+pub fn load_cached_repo() -> Option<String> {
+    let path = repo_cache_path();
+    if path.exists() {
+        fs::read_to_string(&path).ok()
+    } else {
+        None
+    }
+}
+
+pub fn repo_age_seconds() -> u64 {
+    let path = repo_cache_path();
+    if !path.exists() {
+        return u64::MAX;
+    }
+    if let Ok(meta) = fs::metadata(&path) {
+        if let Ok(modified) = meta.modified() {
+            if let Ok(elapsed) = modified.elapsed() {
+                return elapsed.as_secs();
+            }
+        }
+    }
+    u64::MAX
+}
+
 pub fn installed_packages() -> Vec<String> {
     let dir = manifest_dir();
     if !dir.exists() {
@@ -47,31 +81,19 @@ pub fn get_installed_files(name: &str) -> Vec<String> {
         .collect()
 }
 
-pub fn record_install(name: &str, version: &str, files: &[String]) {
+pub fn record_install(name: &str, version: &str, release: u32, files: &[String]) {
     let pkg_dir = manifest_dir().join(name);
     fs::create_dir_all(&pkg_dir).expect("failed to create manifest directory");
 
     let manifest = files.join("\n");
     fs::write(pkg_dir.join("manifest"), &manifest).expect("failed to write manifest");
-    fs::write(pkg_dir.join("version"), format!("{}\n", version)).expect("failed to write version");
+    fs::write(pkg_dir.join("version"), format!("{}-{}\n", version, release)).expect("failed to write version");
 }
 
 pub fn remove_package(name: &str) {
     let pkg_dir = manifest_dir().join(name);
     if pkg_dir.exists() {
         fs::remove_dir_all(&pkg_dir).expect("failed to remove package manifest");
-    }
-}
-
-pub fn record_installed_file(name: &str, file_path: &str) {
-    let manifest_file = manifest_dir().join(name).join("manifest");
-    if let Ok(content) = fs::read_to_string(&manifest_file) {
-        let mut lines: Vec<String> = content.lines().map(|l| l.to_string()).collect();
-        if !lines.contains(&file_path.to_string()) {
-            lines.push(file_path.to_string());
-            fs::write(&manifest_file, format!("{}\n", lines.join("\n")))
-                .expect("failed to update manifest");
-        }
     }
 }
 
@@ -136,15 +158,4 @@ pub fn all_frozen() -> Vec<String> {
         .map(|l| l.trim().to_string())
         .filter(|l| !l.is_empty())
         .collect()
-}
-
-pub fn list_old_manifests() -> Vec<String> {
-    let mut old = Vec::new();
-    for pkg in installed_packages() {
-        let version_file = manifest_dir().join(&pkg).join("old_versions");
-        if version_file.exists() {
-            old.push(pkg);
-        }
-    }
-    old
 }

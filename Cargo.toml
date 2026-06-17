@@ -8,7 +8,4 @@ description = "Swell Blazing Package Manager — source-based, written in Rust"
 clap = { version = "4", features = ["derive"] }
 reqwest = { version = "0.12", features = ["blocking"] }
 sha2 = "0.10"
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-toml = "0.8"
 walkdir = "2"

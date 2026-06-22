@@ -5,7 +5,8 @@ mod install;
 mod repo;
 
 use clap::{Parser, Subcommand};
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::process::Command;
 
 const REPO_URL: &str = "https://packages.swellos.org/repo.db";
 
@@ -39,16 +40,29 @@ enum Commands {
     /// Sync repo metadata and upgrade all
     #[command(alias = "-Syu")]
     SyncUpgrade,
-    /// Pin all installed packages
-    Freeze,
-    /// Unpin and resume rolling
-    Unfreeze,
+    /// Freeze packages (prevent upgrades)
+    #[command(alias = "-F")]
+    Freeze {
+        /// Package names to freeze (empty = freeze all)
+        packages: Vec<String>,
+    },
+    /// Unfreeze packages (resume upgrades)
+    #[command(alias = "-u")]
+    Unfreeze {
+        /// Package names to unfreeze (empty = unfreeze all)
+        packages: Vec<String>,
+    },
     /// List installed packages
-    #[command(alias = "-L")]
+    #[command(alias = "-L", alias = "-Q")]
     List,
     /// Show info about a package
     #[command(alias = "-I")]
     Info {
+        package: String,
+    },
+    /// Build a package from source and install it
+    Build {
+        /// Package name to build
         package: String,
     },
 }
@@ -113,17 +127,39 @@ fn main() {
             };
             upgrade_all(packages_list);
         }
-        Some(Commands::Freeze) => {
-            for pkg in db::installed_packages() {
-                db::freeze_package(&pkg);
+        Some(Commands::Freeze { packages }) => {
+            if packages.is_empty() {
+                for pkg in db::installed_packages() {
+                    db::freeze_package(&pkg);
+                }
+                println!("All installed packages frozen.");
+            } else {
+                for pkg in &packages {
+                    if !db::is_installed(pkg) {
+                        eprintln!("error: {} is not installed", pkg);
+                        std::process::exit(1);
+                    }
+                    db::freeze_package(pkg);
+                    println!("Frozen: {}", pkg);
+                }
             }
-            println!("All installed packages frozen.");
         }
-        Some(Commands::Unfreeze) => {
-            for pkg in db::all_frozen() {
-                db::unfreeze_package(&pkg);
+        Some(Commands::Unfreeze { packages }) => {
+            if packages.is_empty() {
+                for pkg in db::all_frozen() {
+                    db::unfreeze_package(&pkg);
+                }
+                println!("All packages unfrozen.");
+            } else {
+                for pkg in &packages {
+                    if !db::is_frozen(pkg) {
+                        eprintln!("warning: {} is not frozen", pkg);
+                        continue;
+                    }
+                    db::unfreeze_package(pkg);
+                    println!("Unfrozen: {}", pkg);
+                }
             }
-            println!("All packages unfrozen.");
         }
         Some(Commands::List) => {
             let installed = db::installed_packages();
@@ -160,16 +196,28 @@ fn main() {
                 Err(e) => eprintln!("error: {}", e),
             }
         }
+        Some(Commands::Build { package }) => {
+            if db::is_frozen(&package) {
+                eprintln!("error: {} is frozen", package);
+                std::process::exit(1);
+            }
+            if let Err(e) = build_and_install(&package) {
+                eprintln!("error: {}: {}", package, e);
+                std::process::exit(1);
+            }
+        }
         None => {
-            println!("sbpm -Syu    Sync and upgrade");
-            println!("sbpm -S pkg  Install package");
-            println!("sbpm -R pkg  Remove package");
-            println!("sbpm -U      Upgrade all");
-            println!("sbpm -Ss q   Search packages");
-            println!("sbpm -L      List installed");
-            println!("sbpm -I pkg  Show package info");
-            println!("sbpm freeze  Freeze all installed");
-            println!("sbpm unfreeze");
+            println!("sbpm -Syu     Sync and upgrade");
+            println!("sbpm -S pkg   Install package");
+            println!("sbpm -R pkg   Remove package");
+            println!("sbpm -U       Upgrade all");
+            println!("sbpm -Ss q    Search packages");
+            println!("sbpm -L       List installed");
+            println!("sbpm -Q       List installed");
+            println!("sbpm -I pkg   Show package info");
+            println!("sbpm -F pkg   Freeze package (omit pkg for all)");
+            println!("sbpm -u pkg   Unfreeze package (omit pkg for all)");
+            println!("sbpm build pkg Build from source and install");
         }
     }
 }
@@ -182,7 +230,6 @@ fn load_repo() -> Result<Vec<repo::Package>, String> {
         }
     }
 
-    // Fetch fresh repo.db
     println!("Fetching package index...");
     let resp = reqwest::blocking::get(REPO_URL)
         .map_err(|e| format!("failed to fetch repo.db: {}", e))?;
@@ -203,7 +250,6 @@ fn install_package(packages: &[repo::Package], name: &str) -> Result<(), String>
     let pkg = repo::find_package(packages, name)
         .ok_or_else(|| format!("package not found: {}", name))?;
 
-    // Install dependencies first
     for dep in &pkg.depends {
         if !db::is_installed(dep) {
             println!("Installing dependency: {}", dep);
@@ -263,7 +309,6 @@ fn upgrade_all(packages: &[repo::Package]) {
 
                 println!("Upgrading: {} {} -> {}", pkg_name, current, available);
 
-                // Remove old files
                 let old_files = db::get_installed_files(pkg_name);
                 for file in &old_files {
                     let path = Path::new(file);
@@ -272,7 +317,6 @@ fn upgrade_all(packages: &[repo::Package]) {
                     }
                 }
 
-                // Download and install new version
                 match install::download_package(&pkg.name, &pkg.url, &pkg.sha256) {
                     Ok(archive) => {
                         match install::extract_and_install(&archive, &pkg.name) {
@@ -303,4 +347,154 @@ fn search_packages(packages: &[repo::Package], query: &str) {
         let installed = if db::is_installed(&pkg.name) { " [installed]" } else { "" };
         println!("  {}-{}{}{}", pkg.name, pkg.version, pkg.release, installed);
     }
+}
+
+fn find_swell_build() -> Result<String, String> {
+    // Check common locations
+    let candidates = vec![
+        "swell-build".to_string(),
+        "/usr/local/bin/swell-build".to_string(),
+        "/usr/bin/swell-build".to_string(),
+        "/usr/src/swell/swell-build/target/release/swell-build".to_string(),
+    ];
+
+    for candidate in &candidates {
+        if candidate.contains('/') {
+            if Path::new(candidate).exists() {
+                return Ok(candidate.clone());
+            }
+        } else {
+            // Check PATH
+            if let Ok(output) = Command::new("which").arg(candidate).output() {
+                if output.status.success() {
+                    return Ok(candidate.clone());
+                }
+            }
+        }
+    }
+
+    Err("swell-build not found. Install it from https://github.com/SwellOS/swell-build or set up the build workspace at /usr/src/swell/".to_string())
+}
+
+fn find_built_package(repo_dir: &Path, name: &str) -> Result<PathBuf, String> {
+    let pkgs_dir = repo_dir.join("packages");
+    let search_dir = if pkgs_dir.exists() { &pkgs_dir } else { repo_dir };
+
+    if !search_dir.exists() {
+        return Err(format!("repo directory not found: {}", search_dir.display()));
+    }
+
+    for entry in std::fs::read_dir(search_dir).map_err(|e| format!("failed to read repo dir: {}", e))? {
+        let entry = entry.map_err(|e| format!("failed to read entry: {}", e))?;
+        let path = entry.path();
+        if path.extension().map_or(false, |e| e == "swell") {
+            let filename = path.file_name().and_then(|s| s.to_str()).unwrap_or("");
+            // Format: {name}-{version}-{release}-{arch}.swell
+            if filename.starts_with(&format!("{}-", name)) {
+                return Ok(path);
+            }
+        }
+    }
+
+    Err(format!("built package not found for {} in {}", name, search_dir.display()))
+}
+
+fn build_and_install(name: &str) -> Result<(), String> {
+    let swell_build = find_swell_build()?;
+
+    // Determine the repo directory from environment or default
+    let repo_dir = PathBuf::from(std::env::var("SWELL_REPO").unwrap_or_else(|_| "/usr/src/swell/repo".to_string()));
+
+    println!("Building {} from source...", name);
+    let status = Command::new(&swell_build)
+        .args(["pkg", name])
+        .status()
+        .map_err(|e| format!("failed to run swell-build: {}", e))?;
+
+    if !status.success() {
+        return Err(format!("swell-build failed for package '{}'", name));
+    }
+
+    // Find the built .swell archive
+    let built = find_built_package(&repo_dir, name)?;
+    println!("  Built: {}", built.display());
+
+    // Read metadata from the .swell archive to get version info
+    let metadata_str = read_metadata_from_swell(&built)?;
+    let (version, release) = parse_metadata_version(&metadata_str)?;
+
+    // Check deps from metadata
+    let depends = parse_metadata_depends(&metadata_str);
+
+    // Install dependencies first (from repo if available)
+    if let Ok(repo_packages) = load_repo() {
+        for dep in &depends {
+            if !db::is_installed(dep) {
+                println!("Installing dependency: {}", dep);
+                if let Err(e) = install_package(&repo_packages, dep) {
+                    eprintln!("warning: could not install dependency {}: {}", dep, e);
+                }
+            }
+        }
+    }
+
+    // Install files from the built archive
+    let files = install::extract_and_install(&built, name)?;
+    db::record_install(name, &version, release, &files);
+    println!("  Installed: {}-{}", name, version);
+    Ok(())
+}
+
+fn read_metadata_from_swell(archive: &Path) -> Result<String, String> {
+    let output = Command::new("tar")
+        .args(["--zstd", "-xf", &archive.to_string_lossy(), "--to-stdout", "metadata.toml"])
+        .output()
+        .map_err(|e| format!("failed to read metadata from .swell: {}", e))?;
+
+    if !output.status.success() {
+        return Err("failed to extract metadata.toml from .swell archive".to_string());
+    }
+
+    String::from_utf8(output.stdout).map_err(|e| format!("invalid metadata encoding: {}", e))
+}
+
+fn parse_metadata_version(metadata: &str) -> Result<(String, u32), String> {
+    // Parse TOML-like metadata: name = "...", version = "...", release = N
+    let mut version = String::new();
+    let mut release = 0u32;
+
+    for line in metadata.lines() {
+        let line = line.trim();
+        if let Some(val) = line.strip_prefix("version = ") {
+            version = val.trim_matches('"').to_string();
+        }
+        if let Some(val) = line.strip_prefix("release = ") {
+            release = val.parse::<u32>().unwrap_or(0);
+        }
+    }
+
+    if version.is_empty() {
+        return Err("version not found in metadata.toml".to_string());
+    }
+
+    Ok((version, release))
+}
+
+fn parse_metadata_depends(metadata: &str) -> Vec<String> {
+    for line in metadata.lines() {
+        let line = line.trim();
+        if let Some(val) = line.strip_prefix("depends = ") {
+            let val = val.trim();
+            if val == "[]" {
+                return Vec::new();
+            }
+            // Parse ["dep1", "dep2"]
+            let inner = val.trim_start_matches('[').trim_end_matches(']');
+            return inner.split(',')
+                .map(|s| s.trim().trim_matches('"').to_string())
+                .filter(|s| !s.is_empty())
+                .collect();
+        }
+    }
+    Vec::new()
 }

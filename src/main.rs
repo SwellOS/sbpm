@@ -8,7 +8,7 @@ use clap::{Parser, Subcommand};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-const REPO_URL: &str = "https://packages.swellos.org/repo.db";
+const REPO_URL: &str = "https://raw.githubusercontent.com/SwellOS/packages/gh-pages/repo.db";
 
 #[derive(Parser)]
 #[command(name = "sbpm", about = "Swell Blazing Package Manager", version)]
